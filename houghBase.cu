@@ -19,6 +19,11 @@ const int degreeInc = 2;
 const int degreeBins = 180 / degreeInc;
 const int rBins = 100;
 const float radInc = degreeInc * M_PI / 180;
+
+#ifdef __CUDACC__
+__constant__ float d_Cos[degreeBins];
+__constant__ float d_Sin[degreeBins];
+#endif
 //*****************************************************************
 // The CPU function returns a pointer to the accummulator
 void CPU_HoughTran (unsigned char *pic, int w, int h, int **acc)
@@ -65,10 +70,30 @@ void CPU_HoughTran (unsigned char *pic, int w, int h, int **acc)
 //   //TODO
 // }
 //TODO Kernel memoria Constante
-// __global__ void GPU_HoughTranConst(...)
-// {
-//   //TODO
-// }
+__global__ void GPU_HoughTranConst(unsigned char *pic, int w, int h, int *acc, float rMax, float rScale)
+{
+  int gloID = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gloID >= w * h) return;
+
+  int xCent = w / 2;
+  int yCent = h / 2;
+
+  int xCoord = gloID % w - xCent;
+  int yCoord = yCent - gloID / w;
+
+  if (pic[gloID] > 0)
+  {
+    for (int tIdx = 0; tIdx < degreeBins; tIdx++)
+    {
+      float r = xCoord * d_Cos[tIdx] + yCoord * d_Sin[tIdx];
+      int rIdx = (r + rMax) / rScale;
+      if (rIdx >= 0 && rIdx < rBins)
+      {
+        atomicAdd(acc + (rIdx * degreeBins + tIdx), 1);
+      }
+    }
+  }
+}
 
 // GPU kernel. One thread per image pixel is spawned.
 // The accummulator memory needs to be allocated by the host in global memory
@@ -205,23 +230,21 @@ int main (int argc, char **argv)
   cudaEventRecord(stopPrecompute);
   cudaEventSynchronize(stopPrecompute);
 
-  float* d_Cos;
-  float* d_Sin;
-
-  // 3. Medición: Tiempo de alocación de memoria GPU (d_Cos, d_Sin)
-  cudaEventRecord(startMallocGPU1);
-  cudaMalloc ((void **) &d_Cos, sizeof (float) * degreeBins);
-  cudaMalloc ((void **) &d_Sin, sizeof (float) * degreeBins);
-  cudaEventRecord(stopMallocGPU1);
-  cudaEventSynchronize(stopMallocGPU1);
+  
 
   float rMax = sqrt (1.0 * w * w + 1.0 * h * h) / 2;
   float rScale = 2 * rMax / rBins;
 
   // 4. Medición: Tiempo de transferencia Host to Device (cos/sin)
   cudaEventRecord(startH2D_CosSin);
-  cudaMemcpy(d_Cos, pcCos, sizeof (float) * degreeBins, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_Sin, pcSin, sizeof (float) * degreeBins, cudaMemcpyHostToDevice);
+  cudaError_t err1 = cudaMemcpyToSymbol(d_Cos, pcCos, sizeof(float) * degreeBins);
+  cudaError_t err2 = cudaMemcpyToSymbol(d_Sin, pcSin, sizeof(float) * degreeBins);
+  if (err1 != cudaSuccess || err2 != cudaSuccess) {
+      printf("Error al copiar a memoria constante: %s / %s\n",
+          cudaGetErrorString(err1), cudaGetErrorString(err2));
+  } else {
+      printf("Copiados %d valores a memoria constante correctamente.\n", degreeBins);
+  }
   cudaEventRecord(stopH2D_CosSin);
   cudaEventSynchronize(stopH2D_CosSin);
 
@@ -263,7 +286,7 @@ int main (int argc, char **argv)
   
   // 9. Medición: Tiempo de ejecución del kernel GPU (memoria global)
   cudaEventRecord(startKernel);
-  GPU_HoughTran <<< blockNum, 256 >>> (d_in, w, h, d_hough, rMax, rScale, d_Cos, d_Sin);
+  GPU_HoughTranConst <<< blockNum, 256 >>> (d_in, w, h, d_hough, rMax, rScale);
   cudaEventRecord(stopKernel);
   
   // 10. Medición: Tiempo de sincronización después del kernel
@@ -275,6 +298,9 @@ int main (int argc, char **argv)
   // 11. Medición: Tiempo de transferencia Device to Host
   cudaEventRecord(startD2H);
   cudaMemcpy (h_hough, d_hough, sizeof (int) * degreeBins * rBins, cudaMemcpyDeviceToHost);
+  int sumGPU = 0;
+  for (int i = 0; i < degreeBins * rBins; i++) sumGPU += h_hough[i];
+  printf("Suma total acumulador GPU: %d\n", sumGPU);
   cudaEventRecord(stopD2H);
   cudaEventSynchronize(stopD2H);
 
@@ -482,8 +508,6 @@ int main (int argc, char **argv)
 
   // Liberar memoria
   free(outputImg);
-  cudaFree(d_Cos);
-  cudaFree(d_Sin);
   cudaFree(d_in);
   cudaFree(d_hough);
   free(h_hough);
