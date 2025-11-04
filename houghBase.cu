@@ -43,7 +43,9 @@ void CPU_HoughTran (unsigned char *pic, int w, int h, int **acc)
               {
                 float r = xCoord * cos (theta) + yCoord * sin (theta);
                 int rIdx = (r + rMax) / rScale;
-                (*acc)[rIdx * degreeBins + tIdx]++; //+1 para este radio r y este theta
+                // Validar que rIdx esté en el rango correcto
+                if (rIdx >= 0 && rIdx < rBins)
+                  (*acc)[rIdx * degreeBins + tIdx]++; //+1 para este radio r y este theta
                 theta += radInc;
               }
           }
@@ -106,8 +108,12 @@ __global__ void GPU_HoughTran (unsigned char *pic, int w, int h, int *acc, float
           //float r = xCoord * cos(tIdx) + yCoord * sin(tIdx); //probar con esto para ver diferencia en tiempo
           float r = xCoord * d_Cos[tIdx] + yCoord * d_Sin[tIdx];
           int rIdx = (r + rMax) / rScale;
-          //debemos usar atomic, pero que race condition hay si somos un thread por pixel? explique
-          atomicAdd (acc + (rIdx * degreeBins + tIdx), 1);
+          // Validar que rIdx esté en el rango correcto
+          if (rIdx >= 0 && rIdx < rBins)
+          {
+            //debemos usar atomic, pero que race condition hay si somos un thread por pixel? explique
+            atomicAdd (acc + (rIdx * degreeBins + tIdx), 1);
+          }
         }
     }
 
@@ -127,17 +133,66 @@ int main (int argc, char **argv)
   int *cpuht;
   int w = inImg.x_dim;
   int h = inImg.y_dim;
+  
+  printf("Dimensiones de la imagen: %d x %d\n", w, h);
 
-  float* d_Cos;
-  float* d_Sin;
+  // Crear eventos CUDA para todas las mediciones (BITÁCORA - Versión Memoria Global)
+  cudaEvent_t startTotal, stopTotal;
+  cudaEvent_t startCPU, stopCPU;
+  cudaEvent_t startPrecompute, stopPrecompute;
+  cudaEvent_t startMallocGPU1, stopMallocGPU1;
+  cudaEvent_t startMallocGPU2, stopMallocGPU2;
+  cudaEvent_t startMallocGPU3, stopMallocGPU3;
+  cudaEvent_t startMemsetGPU, stopMemsetGPU;
+  cudaEvent_t startH2D_CosSin, stopH2D_CosSin;
+  cudaEvent_t startH2D_Image, stopH2D_Image;
+  cudaEvent_t startKernel, stopKernel;
+  cudaEvent_t startKernelSync, stopKernelSync;
+  cudaEvent_t startD2H, stopD2H;
+  cudaEvent_t startStats, stopStats;
+  cudaEvent_t startOutputImg, stopOutputImg;
+  
+  // Crear todos los eventos
+  cudaEventCreate(&startTotal);
+  cudaEventCreate(&stopTotal);
+  cudaEventCreate(&startCPU);
+  cudaEventCreate(&stopCPU);
+  cudaEventCreate(&startPrecompute);
+  cudaEventCreate(&stopPrecompute);
+  cudaEventCreate(&startMallocGPU1);
+  cudaEventCreate(&stopMallocGPU1);
+  cudaEventCreate(&startMallocGPU2);
+  cudaEventCreate(&stopMallocGPU2);
+  cudaEventCreate(&startMallocGPU3);
+  cudaEventCreate(&stopMallocGPU3);
+  cudaEventCreate(&startMemsetGPU);
+  cudaEventCreate(&stopMemsetGPU);
+  cudaEventCreate(&startH2D_CosSin);
+  cudaEventCreate(&stopH2D_CosSin);
+  cudaEventCreate(&startH2D_Image);
+  cudaEventCreate(&stopH2D_Image);
+  cudaEventCreate(&startKernel);
+  cudaEventCreate(&stopKernel);
+  cudaEventCreate(&startKernelSync);
+  cudaEventCreate(&stopKernelSync);
+  cudaEventCreate(&startD2H);
+  cudaEventCreate(&stopD2H);
+  cudaEventCreate(&startStats);
+  cudaEventCreate(&stopStats);
+  cudaEventCreate(&startOutputImg);
+  cudaEventCreate(&stopOutputImg);
 
-  cudaMalloc ((void **) &d_Cos, sizeof (float) * degreeBins);
-  cudaMalloc ((void **) &d_Sin, sizeof (float) * degreeBins);
+  // Iniciar medición del tiempo total
+  cudaEventRecord(startTotal);
 
-  // CPU calculation
+  // 1. Medición: Tiempo de ejecución CPU
+  cudaEventRecord(startCPU);
   CPU_HoughTran(inImg.pixels, w, h, &cpuht);
+  cudaEventRecord(stopCPU);
+  cudaEventSynchronize(stopCPU);
 
-  // pre-compute values to be stored
+  // 2. Medición: Tiempo de pre-cálculo de cos/sin
+  cudaEventRecord(startPrecompute);
   float *pcCos = (float *) malloc (sizeof (float) * degreeBins);
   float *pcSin = (float *) malloc (sizeof (float) * degreeBins);
   float rad = 0;
@@ -147,13 +202,28 @@ int main (int argc, char **argv)
     pcSin[i] = sin (rad);
     rad += radInc;
   }
+  cudaEventRecord(stopPrecompute);
+  cudaEventSynchronize(stopPrecompute);
+
+  float* d_Cos;
+  float* d_Sin;
+
+  // 3. Medición: Tiempo de alocación de memoria GPU (d_Cos, d_Sin)
+  cudaEventRecord(startMallocGPU1);
+  cudaMalloc ((void **) &d_Cos, sizeof (float) * degreeBins);
+  cudaMalloc ((void **) &d_Sin, sizeof (float) * degreeBins);
+  cudaEventRecord(stopMallocGPU1);
+  cudaEventSynchronize(stopMallocGPU1);
 
   float rMax = sqrt (1.0 * w * w + 1.0 * h * h) / 2;
   float rScale = 2 * rMax / rBins;
 
-  // TODO eventualmente volver memoria global
+  // 4. Medición: Tiempo de transferencia Host to Device (cos/sin)
+  cudaEventRecord(startH2D_CosSin);
   cudaMemcpy(d_Cos, pcCos, sizeof (float) * degreeBins, cudaMemcpyHostToDevice);
   cudaMemcpy(d_Sin, pcSin, sizeof (float) * degreeBins, cudaMemcpyHostToDevice);
+  cudaEventRecord(stopH2D_CosSin);
+  cudaEventSynchronize(stopH2D_CosSin);
 
   // setup and copy data from host to device
   unsigned char *d_in, *h_in;
@@ -163,36 +233,115 @@ int main (int argc, char **argv)
 
   h_hough = (int *) malloc (degreeBins * rBins * sizeof (int));
 
+  // 5. Medición: Tiempo de alocación de memoria GPU (d_in)
+  cudaEventRecord(startMallocGPU2);
   cudaMalloc ((void **) &d_in, sizeof (unsigned char) * w * h);
+  cudaEventRecord(stopMallocGPU2);
+  cudaEventSynchronize(stopMallocGPU2);
+  
+  // 6. Medición: Tiempo de alocación de memoria GPU (d_hough)
+  cudaEventRecord(startMallocGPU3);
   cudaMalloc ((void **) &d_hough, sizeof (int) * degreeBins * rBins);
-  cudaMemcpy (d_in, h_in, sizeof (unsigned char) * w * h, cudaMemcpyHostToDevice);
+  cudaEventRecord(stopMallocGPU3);
+  cudaEventSynchronize(stopMallocGPU3);
+  
+  // 7. Medición: Tiempo de inicialización de memoria GPU (memset)
+  cudaEventRecord(startMemsetGPU);
   cudaMemset (d_hough, 0, sizeof (int) * degreeBins * rBins);
+  cudaEventRecord(stopMemsetGPU);
+  cudaEventSynchronize(stopMemsetGPU);
+  
+  // 8. Medición: Tiempo de transferencia Host to Device (imagen)
+  cudaEventRecord(startH2D_Image);
+  cudaMemcpy (d_in, h_in, sizeof (unsigned char) * w * h, cudaMemcpyHostToDevice);
+  cudaEventRecord(stopH2D_Image);
+  cudaEventSynchronize(stopH2D_Image);
 
   // execution configuration uses a 1-D grid of 1-D blocks, each made of 256 threads
   //1 thread por pixel
   int blockNum = ceil (1.0 * w * h / 256);
   
-  // Crear eventos CUDA para medir el tiempo del kernel
-  cudaEvent_t start, stop;
-  cudaEventCreate(&start);
-  cudaEventCreate(&stop);
-  
-  // Registrar el evento de inicio
-  cudaEventRecord(start);
-  
+  // 9. Medición: Tiempo de ejecución del kernel GPU (memoria global)
+  cudaEventRecord(startKernel);
   GPU_HoughTran <<< blockNum, 256 >>> (d_in, w, h, d_hough, rMax, rScale, d_Cos, d_Sin);
+  cudaEventRecord(stopKernel);
   
-  // Registrar el evento de fin
-  cudaEventRecord(stop);
-  cudaEventSynchronize(stop);
-  
-  // Calcular el tiempo transcurrido
-  float milliseconds = 0;
-  cudaEventElapsedTime(&milliseconds, start, stop);
-  printf("Tiempo de ejecución del kernel CUDA: %.3f ms\n", milliseconds);
+  // 10. Medición: Tiempo de sincronización después del kernel
+  cudaEventRecord(startKernelSync);
+  cudaEventSynchronize(stopKernel);
+  cudaEventRecord(stopKernelSync);
+  cudaEventSynchronize(stopKernelSync);
 
-  // get results from device
+  // 11. Medición: Tiempo de transferencia Device to Host
+  cudaEventRecord(startD2H);
   cudaMemcpy (h_hough, d_hough, sizeof (int) * degreeBins * rBins, cudaMemcpyDeviceToHost);
+  cudaEventRecord(stopD2H);
+  cudaEventSynchronize(stopD2H);
+
+  // Calcular todos los tiempos medidos (se inicializan aquí, se calculan después)
+  float timeCPU = 0, timePrecompute = 0;
+  float timeMallocGPU1 = 0, timeMallocGPU2 = 0, timeMallocGPU3 = 0;
+  float timeMemsetGPU = 0, timeH2D_CosSin = 0, timeH2D_Image = 0;
+  float timeKernel = 0, timeKernelSync = 0, timeD2H = 0;
+  float timeStats = 0, timeOutputImg = 0;
+  
+  cudaEventElapsedTime(&timeCPU, startCPU, stopCPU);
+  cudaEventElapsedTime(&timePrecompute, startPrecompute, stopPrecompute);
+  cudaEventElapsedTime(&timeMallocGPU1, startMallocGPU1, stopMallocGPU1);
+  cudaEventElapsedTime(&timeMallocGPU2, startMallocGPU2, stopMallocGPU2);
+  cudaEventElapsedTime(&timeMallocGPU3, startMallocGPU3, stopMallocGPU3);
+  cudaEventElapsedTime(&timeMemsetGPU, startMemsetGPU, stopMemsetGPU);
+  cudaEventElapsedTime(&timeH2D_CosSin, startH2D_CosSin, stopH2D_CosSin);
+  cudaEventElapsedTime(&timeH2D_Image, startH2D_Image, stopH2D_Image);
+  cudaEventElapsedTime(&timeKernel, startKernel, stopKernel);
+  cudaEventElapsedTime(&timeKernelSync, startKernelSync, stopKernelSync);
+  cudaEventElapsedTime(&timeD2H, startD2H, stopD2H);
+  
+  // Mostrar bitácora de tiempos
+  printf("\n");
+  printf("╔════════════════════════════════════════════════════════════╗\n");
+  printf("║   BITÁCORA DE TIEMPOS - KERNEL MEMORIA GLOBAL             ║\n");
+  printf("╠════════════════════════════════════════════════════════════╣\n");
+  printf("║ 1. Tiempo ejecución CPU:              %10.3f ms ║\n", timeCPU);
+  printf("║ 2. Tiempo pre-cálculo cos/sin:        %10.3f ms ║\n", timePrecompute);
+  printf("║ 3. Tiempo alocación GPU (cos/sin):     %10.3f ms ║\n", timeMallocGPU1);
+  printf("║ 4. Tiempo transferencia H->D (cos/sin):%10.3f ms ║\n", timeH2D_CosSin);
+  printf("║ 5. Tiempo alocación GPU (imagen):     %10.3f ms ║\n", timeMallocGPU2);
+  printf("║ 6. Tiempo alocación GPU (acumulador):  %10.3f ms ║\n", timeMallocGPU3);
+  printf("║ 7. Tiempo inicialización GPU (memset):%10.3f ms ║\n", timeMemsetGPU);
+  printf("║ 8. Tiempo transferencia H->D (imagen):%10.3f ms ║\n", timeH2D_Image);
+  printf("║ 9. Tiempo ejecución kernel GPU:        %10.3f ms ║\n", timeKernel);
+  printf("║10. Tiempo sincronización kernel:      %10.3f ms ║\n", timeKernelSync);
+  printf("║11. Tiempo transferencia D->H:        %10.3f ms ║\n", timeD2H);
+  printf("╠════════════════════════════════════════════════════════════╣\n");
+  float timeGPU_Total = timeMallocGPU1 + timeMallocGPU2 + timeMallocGPU3 + 
+                        timeMemsetGPU + timeH2D_CosSin + timeH2D_Image + 
+                        timeKernel + timeKernelSync + timeD2H;
+  printf("║ Tiempo total operaciones GPU:         %10.3f ms ║\n", timeGPU_Total);
+  printf("╚════════════════════════════════════════════════════════════╝\n");
+  printf("\n");
+
+  // Diagnóstico: contar píxeles con valor > 0 en la imagen
+  int pixelCount = 0;
+  for (i = 0; i < w * h; i++)
+  {
+    if (inImg.pixels[i] > 0)
+      pixelCount++;
+  }
+  printf("Píxeles con valor > 0 en la imagen: %d de %d (%.2f%%)\n", pixelCount, w * h, 100.0 * pixelCount / (w * h));
+
+  // Diagnóstico: encontrar el máximo valor en el acumulador
+  int maxVal = 0;
+  int maxIdx = -1;
+  for (i = 0; i < degreeBins * rBins; i++)
+  {
+    if (h_hough[i] > maxVal)
+    {
+      maxVal = h_hough[i];
+      maxIdx = i;
+    }
+  }
+  printf("Valor máximo en el acumulador: %d (índice: %d)\n", maxVal, maxIdx);
 
   // compare CPU and GPU results
   for (i = 0; i < degreeBins * rBins; i++)
@@ -201,3 +350,188 @@ int main (int argc, char **argv)
       printf ("Calculation mismatch at : %i %i %i\n", i, cpuht[i], h_hough[i]);
   }
   printf("Done!\n");
+
+  // Se implementó la generación de una imagen de salida (formato PPM) 
+  //que muestra las líneas detectadas dibujadas en rojo sobre la imagen original 
+  //en escala de grises. Solo se dibujan las líneas cuyo peso supera el threshold (promedio + 2 desviaciones estándar
+  // 12. Medición: Tiempo de cálculo de estadísticas
+  cudaEventRecord(startStats);
+  long long sum = 0;
+  long long sumSq = 0;
+  int count = degreeBins * rBins;
+  for (i = 0; i < count; i++)
+  {
+    sum += h_hough[i];
+    sumSq += (long long)h_hough[i] * h_hough[i];
+  }
+  float mean = (float)sum / count;
+  float variance = ((float)sumSq / count) - (mean * mean);
+  float stddev = sqrt(variance);
+  int threshold = (int)(mean + 2 * stddev);
+  cudaEventRecord(stopStats);
+  cudaEventSynchronize(stopStats);
+  cudaEventElapsedTime(&timeStats, startStats, stopStats);
+  printf("Pesos - Promedio: %.2f, Desviación estándar: %.2f, Threshold: %d\n", mean, stddev, threshold);
+  printf("Tiempo cálculo estadísticas: %.3f ms\n", timeStats);
+
+  // 13. Medición: Tiempo de generación de imagen de salida
+  cudaEventRecord(startOutputImg);
+  
+  // Generar imagen de salida con líneas detectadas
+  // Crear una imagen RGB (3 canales) para dibujar líneas a color
+  unsigned char *outputImg = (unsigned char *)malloc(w * h * 3);
+  
+  // Copiar la imagen original en escala de grises a los 3 canales
+  for (i = 0; i < w * h; i++)
+  {
+    outputImg[i * 3] = inImg.pixels[i];
+    outputImg[i * 3 + 1] = inImg.pixels[i];
+    outputImg[i * 3 + 2] = inImg.pixels[i];
+  }
+
+  // Dibujar líneas detectadas
+  int xCent = w / 2;
+  int yCent = h / 2;
+  for (int rIdx = 0; rIdx < rBins; rIdx++)
+  {
+    for (int tIdx = 0; tIdx < degreeBins; tIdx++)
+    {
+      int weight = h_hough[rIdx * degreeBins + tIdx];
+      if (weight > threshold)
+      {
+        // Convertir de (r, theta) a coordenadas cartesianas para dibujar la línea
+        // El cálculo inverso: rIdx = (r + rMax) / rScale, entonces r = rIdx * rScale - rMax
+        // Usamos el centro del bin para mayor precisión: r = (rIdx + 0.5) * rScale - rMax
+        float r = (rIdx + 0.5f) * rScale - rMax;
+        float theta = tIdx * radInc;
+        float cosTheta = pcCos[tIdx];
+        float sinTheta = pcSin[tIdx];
+        
+        // Dibujar la línea en la imagen
+        // Usar la ecuación: x*cos(theta) + y*sin(theta) = r
+        for (int x = 0; x < w; x++)
+        {
+          int xCoord = x - xCent;
+          // Calcular y: y = (r - x*cos(theta)) / sin(theta)
+          if (fabs(sinTheta) > 0.0001)
+          {
+            float yCoord = (r - xCoord * cosTheta) / sinTheta;
+            int y = yCent - (int)yCoord; // Convertir de vuelta a coordenadas de imagen
+            
+            if (y >= 0 && y < h)
+            {
+              int idx = (y * w + x) * 3;
+              // Dibujar línea en rojo
+              outputImg[idx] = 255;     // R
+              outputImg[idx + 1] = 0;    // G
+              outputImg[idx + 2] = 0;    // B
+            }
+          }
+        }
+        
+        // También dibujar por columnas para líneas verticales
+        for (int y = 0; y < h; y++)
+        {
+          int yCoord = yCent - y;
+          // Calcular x: x = (r - y*sin(theta)) / cos(theta)
+          if (fabs(cosTheta) > 0.0001)
+          {
+            float xCoord = (r - yCoord * sinTheta) / cosTheta;
+            int x = xCoord + xCent;
+            
+            if (x >= 0 && x < w)
+            {
+              int idx = (y * w + x) * 3;
+              // Dibujar línea en rojo
+              outputImg[idx] = 255;     // R
+              outputImg[idx + 1] = 0;    // G
+              outputImg[idx + 2] = 0;    // B
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Guardar imagen de salida como PPM (formato simple, sin compresión)
+  char outputFilename[256];
+  // Extraer el nombre base del archivo sin extensión
+  char baseName[256];
+  strncpy(baseName, argv[1], sizeof(baseName) - 1);
+  baseName[sizeof(baseName) - 1] = '\0';
+  char *ext = strrchr(baseName, '.');
+  if (ext) *ext = '\0';
+  snprintf(outputFilename, sizeof(outputFilename), "%s_output.ppm", baseName);
+  FILE *fout = fopen(outputFilename, "wb");
+  if (fout)
+  {
+    fprintf(fout, "P6\n%d %d\n255\n", w, h);
+    fwrite(outputImg, 1, w * h * 3, fout);
+    fclose(fout);
+    printf("Imagen de salida guardada como: %s\n", outputFilename);
+  }
+  else
+  {
+    printf("Error: No se pudo crear el archivo de salida\n");
+  }
+  
+  cudaEventRecord(stopOutputImg);
+  cudaEventSynchronize(stopOutputImg);
+  cudaEventElapsedTime(&timeOutputImg, startOutputImg, stopOutputImg);
+  printf("Tiempo generación imagen salida: %.3f ms\n", timeOutputImg);
+
+  // Liberar memoria
+  free(outputImg);
+  cudaFree(d_Cos);
+  cudaFree(d_Sin);
+  cudaFree(d_in);
+  cudaFree(d_hough);
+  free(h_hough);
+  free(pcCos);
+  free(pcSin);
+  delete[] cpuht;
+  
+  // Finalizar medición del tiempo total
+  cudaEventRecord(stopTotal);
+  cudaEventSynchronize(stopTotal);
+  float timeTotal = 0;
+  cudaEventElapsedTime(&timeTotal, startTotal, stopTotal);
+  
+  printf("\n");
+  printf("╔════════════════════════════════════════════════════════════╗\n");
+  printf("║ TIEMPO TOTAL DEL PROGRAMA:            %10.3f ms ║\n", timeTotal);
+  printf("╚════════════════════════════════════════════════════════════╝\n");
+  printf("\n");
+  
+  // Destruir todos los eventos
+  cudaEventDestroy(startTotal);
+  cudaEventDestroy(stopTotal);
+  cudaEventDestroy(startCPU);
+  cudaEventDestroy(stopCPU);
+  cudaEventDestroy(startPrecompute);
+  cudaEventDestroy(stopPrecompute);
+  cudaEventDestroy(startMallocGPU1);
+  cudaEventDestroy(stopMallocGPU1);
+  cudaEventDestroy(startMallocGPU2);
+  cudaEventDestroy(stopMallocGPU2);
+  cudaEventDestroy(startMallocGPU3);
+  cudaEventDestroy(stopMallocGPU3);
+  cudaEventDestroy(startMemsetGPU);
+  cudaEventDestroy(stopMemsetGPU);
+  cudaEventDestroy(startH2D_CosSin);
+  cudaEventDestroy(stopH2D_CosSin);
+  cudaEventDestroy(startH2D_Image);
+  cudaEventDestroy(stopH2D_Image);
+  cudaEventDestroy(startKernel);
+  cudaEventDestroy(stopKernel);
+  cudaEventDestroy(startKernelSync);
+  cudaEventDestroy(stopKernelSync);
+  cudaEventDestroy(startD2H);
+  cudaEventDestroy(stopD2H);
+  cudaEventDestroy(startStats);
+  cudaEventDestroy(stopStats);
+  cudaEventDestroy(startOutputImg);
+  cudaEventDestroy(stopOutputImg);
+
+  return 0;
+}
