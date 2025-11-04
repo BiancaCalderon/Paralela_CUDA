@@ -26,35 +26,31 @@ __constant__ float d_Sin[degreeBins];
 #endif
 //*****************************************************************
 // The CPU function returns a pointer to the accummulator
-void CPU_HoughTran (unsigned char *pic, int w, int h, int **acc)
+void CPU_HoughTran (unsigned char *pic, int w, int h, int **acc, const float *pcCos, const float *pcSin)
 {
-  float rMax = sqrt (1.0 * w * w + 1.0 * h * h) / 2;  //(w^2 + h^2)/2, radio max equivalente a centro -> esquina
-  *acc = new int[rBins * degreeBins];            //el acumulador, conteo depixeles encontrados, 90*180/degInc = 9000
-  memset (*acc, 0, sizeof (int) * rBins * degreeBins); //init en ceros
+  float rMax = sqrt(1.0 * w * w + 1.0 * h * h) / 2;
+  *acc = new int[rBins * degreeBins];
+  memset(*acc, 0, sizeof(int) * rBins * degreeBins);
   int xCent = w / 2;
   int yCent = h / 2;
   float rScale = 2 * rMax / rBins;
 
-  for (int i = 0; i < w; i++) //por cada pixel
-    for (int j = 0; j < h; j++) //...
-      {
-        int idx = j * w + i;
-        if (pic[idx] > 0) //si pasa thresh, entonces lo marca
-          {
-            int xCoord = i - xCent;
-            int yCoord = yCent - j;  // y-coord has to be reversed
-            float theta = 0;         // actual angle
-            for (int tIdx = 0; tIdx < degreeBins; tIdx++) //add 1 to all lines in that pixel
-              {
-                float r = xCoord * cos (theta) + yCoord * sin (theta);
-                int rIdx = (r + rMax) / rScale;
-                // Validar que rIdx esté en el rango correcto
-                if (rIdx >= 0 && rIdx < rBins)
-                  (*acc)[rIdx * degreeBins + tIdx]++; //+1 para este radio r y este theta
-                theta += radInc;
-              }
+  for (int i = 0; i < w; i++) {
+    for (int j = 0; j < h; j++) {
+      int idx = j * w + i;
+      if (pic[idx] > 0) {
+        int xCoord = i - xCent;
+        int yCoord = yCent - j;
+        for (int tIdx = 0; tIdx < degreeBins; tIdx++) {
+          float r = xCoord * pcCos[tIdx] + yCoord * pcSin[tIdx];
+          int rIdx = (int)((r + rMax) / rScale);
+          if (rIdx >= 0 && rIdx < rBins) {
+            (*acc)[rIdx * degreeBins + tIdx]++;
           }
+        }
       }
+    }
+  }
 }
 
 //*****************************************************************
@@ -97,7 +93,7 @@ __global__ void GPU_HoughTranConst(unsigned char *pic, int w, int h, int *acc, f
 
 // GPU kernel. One thread per image pixel is spawned.
 // The accummulator memory needs to be allocated by the host in global memory
-__global__ void GPU_HoughTran (unsigned char *pic, int w, int h, int *acc, float rMax, float rScale, float *d_Cos, float *d_Sin)
+/*__global__ void GPU_HoughTran (unsigned char *pic, int w, int h, int *acc, float rMax, float rScale, float *d_Cos, float *d_Sin)
 {
   // Cálculo del globalID: en una configuración 1D de bloques y threads
   // El globalID es el índice único de cada thread en el grid completo
@@ -147,7 +143,7 @@ __global__ void GPU_HoughTran (unsigned char *pic, int w, int h, int *acc, float
   //faltara sincronizar los hilos del bloque en algunos lados
 
 }
-
+*/
 //*****************************************************************
 int main (int argc, char **argv)
 {
@@ -165,7 +161,6 @@ int main (int argc, char **argv)
   cudaEvent_t startTotal, stopTotal;
   cudaEvent_t startCPU, stopCPU;
   cudaEvent_t startPrecompute, stopPrecompute;
-  cudaEvent_t startMallocGPU1, stopMallocGPU1;
   cudaEvent_t startMallocGPU2, stopMallocGPU2;
   cudaEvent_t startMallocGPU3, stopMallocGPU3;
   cudaEvent_t startMemsetGPU, stopMemsetGPU;
@@ -184,8 +179,6 @@ int main (int argc, char **argv)
   cudaEventCreate(&stopCPU);
   cudaEventCreate(&startPrecompute);
   cudaEventCreate(&stopPrecompute);
-  cudaEventCreate(&startMallocGPU1);
-  cudaEventCreate(&stopMallocGPU1);
   cudaEventCreate(&startMallocGPU2);
   cudaEventCreate(&stopMallocGPU2);
   cudaEventCreate(&startMallocGPU3);
@@ -210,11 +203,8 @@ int main (int argc, char **argv)
   // Iniciar medición del tiempo total
   cudaEventRecord(startTotal);
 
-  // 1. Medición: Tiempo de ejecución CPU
-  cudaEventRecord(startCPU);
-  CPU_HoughTran(inImg.pixels, w, h, &cpuht);
-  cudaEventRecord(stopCPU);
-  cudaEventSynchronize(stopCPU);
+ 
+ 
 
   // 2. Medición: Tiempo de pre-cálculo de cos/sin
   cudaEventRecord(startPrecompute);
@@ -223,14 +213,17 @@ int main (int argc, char **argv)
   float rad = 0;
   for (i = 0; i < degreeBins; i++)
   {
-    pcCos[i] = cos (rad);
-    pcSin[i] = sin (rad);
+    pcCos[i] = cosf(rad);
+    pcSin[i] = sinf(rad);
     rad += radInc;
   }
   cudaEventRecord(stopPrecompute);
   cudaEventSynchronize(stopPrecompute);
 
-  
+  cudaEventRecord(startCPU);
+  CPU_HoughTran(inImg.pixels, w, h, &cpuht, pcCos, pcSin);
+  cudaEventRecord(stopCPU);
+  cudaEventSynchronize(stopCPU);
 
   float rMax = sqrt (1.0 * w * w + 1.0 * h * h) / 2;
   float rScale = 2 * rMax / rBins;
@@ -282,11 +275,16 @@ int main (int argc, char **argv)
 
   // execution configuration uses a 1-D grid of 1-D blocks, each made of 256 threads
   //1 thread por pixel
+  
   int blockNum = ceil (1.0 * w * h / 256);
   
   // 9. Medición: Tiempo de ejecución del kernel GPU (memoria global)
   cudaEventRecord(startKernel);
   GPU_HoughTranConst <<< blockNum, 256 >>> (d_in, w, h, d_hough, rMax, rScale);
+  cudaError_t kerr = cudaGetLastError();
+  if (kerr != cudaSuccess) {
+      printf("Error lanzando kernel: %s\n", cudaGetErrorString(kerr));
+  }
   cudaEventRecord(stopKernel);
   
   // 10. Medición: Tiempo de sincronización después del kernel
@@ -306,14 +304,13 @@ int main (int argc, char **argv)
 
   // Calcular todos los tiempos medidos (se inicializan aquí, se calculan después)
   float timeCPU = 0, timePrecompute = 0;
-  float timeMallocGPU1 = 0, timeMallocGPU2 = 0, timeMallocGPU3 = 0;
+  float timeMallocGPU2 = 0, timeMallocGPU3 = 0;
   float timeMemsetGPU = 0, timeH2D_CosSin = 0, timeH2D_Image = 0;
   float timeKernel = 0, timeKernelSync = 0, timeD2H = 0;
   float timeStats = 0, timeOutputImg = 0;
   
   cudaEventElapsedTime(&timeCPU, startCPU, stopCPU);
   cudaEventElapsedTime(&timePrecompute, startPrecompute, stopPrecompute);
-  cudaEventElapsedTime(&timeMallocGPU1, startMallocGPU1, stopMallocGPU1);
   cudaEventElapsedTime(&timeMallocGPU2, startMallocGPU2, stopMallocGPU2);
   cudaEventElapsedTime(&timeMallocGPU3, startMallocGPU3, stopMallocGPU3);
   cudaEventElapsedTime(&timeMemsetGPU, startMemsetGPU, stopMemsetGPU);
@@ -326,11 +323,10 @@ int main (int argc, char **argv)
   // Mostrar bitácora de tiempos
   printf("\n");
   printf("╔════════════════════════════════════════════════════════════╗\n");
-  printf("║   BITÁCORA DE TIEMPOS - KERNEL MEMORIA GLOBAL             ║\n");
+  printf("║   BITÁCORA DE TIEMPOS - KERNEL MEMORIA GLOBAL CONSTANTE    ║\n");
   printf("╠════════════════════════════════════════════════════════════╣\n");
   printf("║ 1. Tiempo ejecución CPU:              %10.3f ms ║\n", timeCPU);
   printf("║ 2. Tiempo pre-cálculo cos/sin:        %10.3f ms ║\n", timePrecompute);
-  printf("║ 3. Tiempo alocación GPU (cos/sin):     %10.3f ms ║\n", timeMallocGPU1);
   printf("║ 4. Tiempo transferencia H->D (cos/sin):%10.3f ms ║\n", timeH2D_CosSin);
   printf("║ 5. Tiempo alocación GPU (imagen):     %10.3f ms ║\n", timeMallocGPU2);
   printf("║ 6. Tiempo alocación GPU (acumulador):  %10.3f ms ║\n", timeMallocGPU3);
@@ -340,7 +336,7 @@ int main (int argc, char **argv)
   printf("║10. Tiempo sincronización kernel:      %10.3f ms ║\n", timeKernelSync);
   printf("║11. Tiempo transferencia D->H:        %10.3f ms ║\n", timeD2H);
   printf("╠════════════════════════════════════════════════════════════╣\n");
-  float timeGPU_Total = timeMallocGPU1 + timeMallocGPU2 + timeMallocGPU3 + 
+  float timeGPU_Total = timeMallocGPU2 + timeMallocGPU3 + 
                         timeMemsetGPU + timeH2D_CosSin + timeH2D_Image + 
                         timeKernel + timeKernelSync + timeD2H;
   printf("║ Tiempo total operaciones GPU:         %10.3f ms ║\n", timeGPU_Total);
@@ -534,8 +530,6 @@ int main (int argc, char **argv)
   cudaEventDestroy(stopCPU);
   cudaEventDestroy(startPrecompute);
   cudaEventDestroy(stopPrecompute);
-  cudaEventDestroy(startMallocGPU1);
-  cudaEventDestroy(stopMallocGPU1);
   cudaEventDestroy(startMallocGPU2);
   cudaEventDestroy(stopMallocGPU2);
   cudaEventDestroy(startMallocGPU3);
