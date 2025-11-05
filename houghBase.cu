@@ -215,8 +215,100 @@ static inline void launchHoughShared(
     );
 }
 //*****************************************************************
+
+//=========================================================================================
+// 
+void runBenchmark(const char* imgName)
+{
+    const int RUNS = 10;
+    float kernelConst[RUNS], gpuConst[RUNS], totalConst[RUNS];
+    float kernelShared[RUNS], gpuShared[RUNS], totalShared[RUNS];
+
+    printf("\n===== BENCHMARK MODE (10 RUNS EACH) =====\n");
+
+    for (int i = 0; i < RUNS; i++) {
+        printf("\n--- Run %d (CONST) ---\n", i+1);
+        fflush(stdout);
+
+        // ejecuta modo constante
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "./hough %s", imgName);
+        FILE* pipe = popen(cmd, "r");
+        if (!pipe) { printf("Error running program\n"); return; }
+
+        char buffer[512];
+        while (fgets(buffer, sizeof(buffer), pipe)) {
+
+            if (strstr(buffer, "Tiempo ejecución kernel GPU")) {
+                sscanf(buffer, "║ 9. Tiempo ejecución kernel GPU: %f ms", &kernelConst[i]);
+            }
+            if (strstr(buffer, "Tiempo total operaciones GPU")) {
+                sscanf(buffer, "║ Tiempo total operaciones GPU: %f ms", &gpuConst[i]);
+            }
+            if (strstr(buffer, "TIEMPO TOTAL DEL PROGRAMA")) {
+                sscanf(buffer, "║ TIEMPO TOTAL DEL PROGRAMA: %f ms", &totalConst[i]);
+            }
+        }
+        pclose(pipe);
+    }
+
+    for (int i = 0; i < RUNS; i++) {
+        printf("\n--- Run %d (SHARED) ---\n", i+1);
+        fflush(stdout);
+
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "./hough %s shared", imgName);
+        FILE* pipe = popen(cmd, "r");
+        if (!pipe) { printf("Error running program\n"); return; }
+
+        char buffer[512];
+        while (fgets(buffer, sizeof(buffer), pipe)) {
+
+            if (strstr(buffer, "Tiempo ejecución kernel GPU")) {
+                sscanf(buffer, "║ 9. Tiempo ejecución kernel GPU: %f ms", &kernelShared[i]);
+            }
+            if (strstr(buffer, "Tiempo total operaciones GPU")) {
+                sscanf(buffer, "║ Tiempo total operaciones GPU: %f ms", &gpuShared[i]);
+            }
+            if (strstr(buffer, "TIEMPO TOTAL DEL PROGRAMA")) {
+                sscanf(buffer, "║ TIEMPO TOTAL DEL PROGRAMA: %f ms", &totalShared[i]);
+            }
+        }
+        pclose(pipe);
+    }
+
+    auto mean = [](float* v){
+        float s = 0; for(int i=0;i<10;i++) s += v[i];
+        return s / 10.0f;
+    };
+    auto stddev = [](float* v){
+        float m = 0; for(int i=0;i<10;i++) m += v[i]; 
+        m /= 10.0f;
+        float s = 0; for(int i=0;i<10;i++) s += (v[i]-m)*(v[i]-m);
+        return sqrtf(s/10.0f);
+    };
+
+    printf("\n==================== RESULTADOS ====================\n");
+    printf(" MODO CONSTANTE\n");
+    printf(" Kernel: %.4f ± %.4f ms\n", mean(kernelConst), stddev(kernelConst));
+    printf(" GPU total: %.4f ± %.4f ms\n", mean(gpuConst), stddev(gpuConst));
+    printf(" Programa total: %.4f ± %.4f ms\n", mean(totalConst), stddev(totalConst));
+
+    printf("\n MODO SHARED\n");
+    printf(" Kernel: %.4f ± %.4f ms\n", mean(kernelShared), stddev(kernelShared));
+    printf(" GPU total: %.4f ± %.4f ms\n", mean(gpuShared), stddev(gpuShared));
+    printf(" Programa total: %.4f ± %.4f ms\n", mean(totalShared), stddev(totalShared));
+    printf("====================================================\n\n");
+}
+//=========================================================================================
+
 int main (int argc, char **argv)
 {
+  if (argc >= 2 && strcmp(argv[1], "benchmark") == 0) {
+    runBenchmark("runway.pgm");
+    return 0;
+  }
+
   int i;
 
   PGMImage inImg (argv[1]);
