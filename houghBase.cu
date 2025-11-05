@@ -91,6 +91,62 @@ __global__ void GPU_HoughTranConst(unsigned char *pic, int w, int h, int *acc, f
   }
 }
 
+// -----------------------------------------------------------------------------
+// Versión con MEMORIA COMPARTIDA: acumula en shared (localAcc) y luego fusiona.
+// Requiere: __constant__ float d_Cos[degreeBins], d_Sin[degreeBins].
+// Acumulador global: int* acc de tamaño rBins * degreeBins.
+// -----------------------------------------------------------------------------
+__global__ void GPU_HoughTranShared(
+    const unsigned char* __restrict__ img,
+    int w, int h,
+    int* __restrict__ acc,
+    float rMax, float rScale
+){
+    int tix   = threadIdx.x;
+    int bdim  = blockDim.x;
+    int gloID = blockIdx.x * bdim + tix;
+
+    extern __shared__ int localAcc[]; // degreeBins * rBins ints
+
+    // Zerar acumulador local
+    for (int idx = tix; idx < degreeBins * rBins; idx += bdim) {
+        localAcc[idx] = 0;
+    }
+    __syncthreads();
+
+    // Votación en shared
+    if (gloID < w * h) {
+        int i = gloID / w;         // fila
+        int j = gloID % w;         // columna
+        unsigned char px = img[gloID];
+
+        if (px > 0) {
+            int xCent = w >> 1;
+            int yCent = h >> 1;
+            float x = (float)j - (float)xCent;
+            float y = (float)yCent - (float)i;  // eje Y hacia arriba
+
+            for (int tIdx = 0; tIdx < degreeBins; ++tIdx) {
+                float r = x * d_Cos[tIdx] + y * d_Sin[tIdx];
+
+                int rIdx = (int)((r + rMax) / rScale);
+
+                if ((unsigned)rIdx < (unsigned)rBins) {
+                    int accIdx = rIdx * degreeBins + tIdx;
+                    atomicAdd(&localAcc[accIdx], 1);
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    // Fusión a global
+    for (int idx = tix; idx < degreeBins * rBins; idx += bdim) {
+        int val = localAcc[idx];
+        if (val) atomicAdd(&acc[idx], val);
+    }
+}
+
 // GPU kernel. One thread per image pixel is spawned.
 // The accummulator memory needs to be allocated by the host in global memory
 /*__global__ void GPU_HoughTran (unsigned char *pic, int w, int h, int *acc, float rMax, float rScale, float *d_Cos, float *d_Sin)
@@ -144,6 +200,20 @@ __global__ void GPU_HoughTranConst(unsigned char *pic, int w, int h, int *acc, f
 
 }
 */
+
+static inline void launchHoughShared(
+    const unsigned char* d_img, int w, int h,
+    int* d_acc, float rMax, float rScale,
+    int threadsPerBlock = 256
+){
+    int pixels = w * h;
+    int blocks = (pixels + threadsPerBlock - 1) / threadsPerBlock;
+    size_t shmem = (size_t)degreeBins * (size_t)rBins * sizeof(int); // 90*100*4 ≈ 36 KB
+
+    GPU_HoughTranShared<<<blocks, threadsPerBlock, shmem>>>(
+        d_img, w, h, d_acc, rMax, rScale
+    );
+}
 //*****************************************************************
 int main (int argc, char **argv)
 {
@@ -158,6 +228,7 @@ int main (int argc, char **argv)
   printf("Dimensiones de la imagen: %d x %d\n", w, h);
 
   // Crear eventos CUDA para todas las mediciones (BITÁCORA - Versión Memoria Global)
+  cudaFree(0);
   cudaEvent_t startTotal, stopTotal;
   cudaEvent_t startCPU, stopCPU;
   cudaEvent_t startPrecompute, stopPrecompute;
@@ -278,9 +349,17 @@ int main (int argc, char **argv)
   
   int blockNum = ceil (1.0 * w * h / 256);
   
-  // 9. Medición: Tiempo de ejecución del kernel GPU (memoria global)
+  // 9. Medición: Tiempo de ejecución del kernel GPU (const vs shared)
+  bool useShared = (argc >= 3 && strcmp(argv[2], "shared") == 0);
+  
   cudaEventRecord(startKernel);
-  GPU_HoughTranConst <<< blockNum, 256 >>> (d_in, w, h, d_hough, rMax, rScale);
+  if (!useShared) {
+      // Versión actual: memoria global + tablas en constante
+      GPU_HoughTranConst<<<blockNum, 256>>>(d_in, w, h, d_hough, rMax, rScale);
+  } else {
+      // Nueva versión: MEMORIA COMPARTIDA + constante
+      launchHoughShared(d_in, w, h, d_hough, rMax, rScale, 256);
+  }
   cudaError_t kerr = cudaGetLastError();
   if (kerr != cudaSuccess) {
       printf("Error lanzando kernel: %s\n", cudaGetErrorString(kerr));
@@ -323,7 +402,11 @@ int main (int argc, char **argv)
   // Mostrar bitácora de tiempos
   printf("\n");
   printf("╔════════════════════════════════════════════════════════════╗\n");
-  printf("║   BITÁCORA DE TIEMPOS - KERNEL MEMORIA GLOBAL CONSTANTE    ║\n");
+  if (!useShared) {
+      printf("║   BITÁCORA DE TIEMPOS - KERNEL MEMORIA GLOBAL CONSTANTE    ║\n");
+  } else {
+      printf("║  BITÁCORA DE TIEMPOS - KERNEL MEMORIA COMPARTIDA + CONST.  ║\n");
+  }
   printf("╠════════════════════════════════════════════════════════════╣\n");
   printf("║ 1. Tiempo ejecución CPU:              %10.3f ms ║\n", timeCPU);
   printf("║ 2. Tiempo pre-cálculo cos/sin:        %10.3f ms ║\n", timePrecompute);
